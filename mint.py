@@ -21,10 +21,13 @@ import uvicorn
 
 # --- FASTAPI for uptime ---
 fast_app = FastAPI()
+
 @fast_app.get("/")
 async def root():
     return {"status": "OK"}
+
 def run_web_server():
+    # Render passes the PORT environment variable; use it.
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(fast_app, host="0.0.0.0", port=port)
 
@@ -48,9 +51,9 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=loggin
 logger = logging.getLogger(__name__)
 
 # --- State ---
-user_wallets = {}  # user_id -> list of wallet addresses
-wallet_state  = {}  # wallet -> dict with sol balance and token balances
-wallet_tasks  = {}  # wallet -> asyncio.Task
+user_wallets = {}   # user_id -> list of wallet addresses
+wallet_state  = {}   # wallet_address -> dict with SOL balance and token balances
+wallet_tasks  = {}   # wallet_address -> asyncio.Task
 
 # --- Utilities ---
 def is_valid_address(addr: str) -> bool:
@@ -60,7 +63,7 @@ def is_valid_address(addr: str) -> bool:
     except Exception:
         return False
 
-# RPC HTTP helpers
+# RPC HTTP helpers using requests
 def rpc_request(method: str, params: list):
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     try:
@@ -77,7 +80,7 @@ async def fetch_balance(addr: str) -> int:
     return 0
 
 async def fetch_token_accounts(addr: str):
-    # getTokenAccountsByOwner with programId and encoding
+    # For getTokenAccountsByOwner, we pass the address and the token program id as strings.
     params = [addr, {"programId": TOKEN_PROGRAM_ID}, {"encoding": "jsonParsed"}]
     res = rpc_request("getTokenAccountsByOwner", params)
     if res:
@@ -86,7 +89,7 @@ async def fetch_token_accounts(addr: str):
 
 # --- Monitoring per wallet ---
 async def monitor_wallet(addr: str, bot, chat_id: int):
-    # Initialize state
+    # Initialize state – fetch initial SOL balance and SPL token accounts
     sol_balance = await fetch_balance(addr)
     token_accounts = await fetch_token_accounts(addr)
     token_balances = {}
@@ -98,14 +101,16 @@ async def monitor_wallet(addr: str, bot, chat_id: int):
             token_balances[mint] = amt
     wallet_state[addr] = {"sol": sol_balance, "tokens": token_balances}
     logger.info(f"Initial state for {addr}: SOL={sol_balance}, tokens={list(token_balances.keys())}")
-    # Websocket subscribe for SOL if available
+
+    # --- SOL Monitoring: Websocket subscription if available, otherwise polling
     async def sol_ws():
         nonlocal sol_balance
         while True:
             try:
                 async with websockets.connect(RPC_WS_URL) as ws:
                     req = {
-                        "jsonrpc": "2.0", "id": 1,
+                        "jsonrpc": "2.0",
+                        "id": 1,
                         "method": "accountSubscribe",
                         "params": [addr, {"encoding": "base64"}]
                     }
@@ -123,14 +128,14 @@ async def monitor_wallet(addr: str, bot, chat_id: int):
                         diff = new_bal - sol_balance
                         if diff != 0:
                             sol = diff/1e9
-                            verb = "Received" if sol>0 else "Sent"
+                            verb = "Received" if sol > 0 else "Sent"
                             text = f"{verb} {abs(sol):.9f} SOL on {addr}"
                             await bot.send_message(chat_id=chat_id, text=text)
                             sol_balance = new_bal
             except Exception as e:
                 logger.error(f"WS error for {addr}: {e}")
                 await asyncio.sleep(5)
-    # Polling for SOL if no websockets
+
     async def sol_poll():
         nonlocal sol_balance
         while True:
@@ -138,12 +143,13 @@ async def monitor_wallet(addr: str, bot, chat_id: int):
             diff = new_bal - sol_balance
             if diff != 0:
                 sol = diff/1e9
-                verb = "Received" if sol>0 else "Sent"
+                verb = "Received" if sol > 0 else "Sent"
                 text = f"{verb} {abs(sol):.9f} SOL on {addr}"
                 await bot.send_message(chat_id=chat_id, text=text)
                 sol_balance = new_bal
             await asyncio.sleep(POLL_INTERVAL)
-    # Polling for SPL tokens
+
+    # --- SPL Token Monitoring (Polling)
     async def spl_poll():
         nonlocal token_balances
         while True:
@@ -155,10 +161,9 @@ async def monitor_wallet(addr: str, bot, chat_id: int):
                 amt = info.get("tokenAmount", {}).get("uiAmount") or 0
                 if mint:
                     curr[mint] = amt
-            # detect new tokens
             for mint, amt in curr.items():
                 prev_amt = token_balances.get(mint, 0)
-                if mint not in token_balances and amt>0:
+                if mint not in token_balances and amt > 0:
                     text = f"New token acquired on {addr}: {mint}, amount: {amt}"
                     await bot.send_message(chat_id=chat_id, text=text)
                 elif amt > prev_amt:
@@ -169,19 +174,18 @@ async def monitor_wallet(addr: str, bot, chat_id: int):
                     diff = prev_amt - amt
                     text = f"Sent {diff} of token {mint} on {addr}"
                     await bot.send_message(chat_id=chat_id, text=text)
-            token_balances = {m:a for m,a in curr.items() if a>0}
+            token_balances = {m: a for m, a in curr.items() if a > 0}
             await asyncio.sleep(POLL_INTERVAL)
-    # Launch tasks
+
     tasks = []
     if USE_WEBSOCKETS:
         tasks.append(asyncio.create_task(sol_ws()))
     else:
         tasks.append(asyncio.create_task(sol_poll()))
     tasks.append(asyncio.create_task(spl_poll()))
-    # Wait until cancelled
     await asyncio.gather(*tasks)
 
-# --- Bot handlers ---
+# --- Telegram Bot Handlers ---
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != AUTHORIZED_USER_ID:
@@ -200,11 +204,10 @@ async def handle_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if addr in wallets:
         await update.message.reply_text(f"Already tracking {addr}")
         return
-    if len(wallets)>=MAX_WALLETS_PER_USER:
-        await update.message.reply_text(f"Max {MAX_WALLETS_PER_USER} wallets")
+    if len(wallets) >= MAX_WALLETS_PER_USER:
+        await update.message.reply_text(f"Max {MAX_WALLETS_PER_USER} wallets reached")
         return
     wallets.append(addr)
-    # start monitoring
     task = asyncio.create_task(monitor_wallet(addr, ctx.bot, uid))
     wallet_tasks[addr] = task
     await update.message.reply_text(f"Now tracking {addr}")
@@ -213,7 +216,6 @@ async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != AUTHORIZED_USER_ID:
         return
-    # cancel all tasks for user
     for addr in user_wallets.get(uid, []):
         task = wallet_tasks.get(addr)
         if task:
@@ -221,11 +223,11 @@ async def stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_wallets[uid] = []
     await update.message.reply_text("Stopped all monitoring.")
 
-# --- Main ---
+# --- Main Entrypoint ---
 def main():
-    # start web server thread
+    # Start the uptime web server thread
     threading.Thread(target=run_web_server, daemon=True).start()
-    # Telegram bot
+    # Build and start the Telegram bot
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
