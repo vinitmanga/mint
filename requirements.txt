@@ -1,4 +1,6 @@
+python-telegram-bot==20.7
 fastapi
 uvicorn
 websockets
+base58
 requests
